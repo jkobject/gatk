@@ -1,13 +1,18 @@
 version 1.0
 
+import "GvsUtils.wdl" as Utils
+
 workflow GvsCreateAltAllele {
   input {
     Boolean go = true
     String dataset_name
     String project_id
+    String call_set_identifier
 
     String? service_account_json_path
   }
+
+  String fq_alt_allele_table = "~{project_id}.~{dataset_name}.alt_allele"
 
   call GetVetTableNames {
     input:
@@ -23,14 +28,24 @@ workflow GvsCreateAltAllele {
       service_account_json_path = service_account_json_path
   }
 
+  call Utils.GetBQTableLastModifiedDatetime {
+    input:
+      go = CreateAltAlleleTable.done,
+      query_project = project_id,
+      fq_table = fq_alt_allele_table,
+      service_account_json_path = service_account_json_path
+  }
+
   scatter (idx in range(length(GetVetTableNames.vet_tables))) {
     call PopulateAltAlleleTable {
       input:
+        call_set_identifier = call_set_identifier,
         dataset_name = dataset_name,
         project_id = project_id,
         create_table_done = CreateAltAlleleTable.done,
         vet_table_name = GetVetTableNames.vet_tables[idx],
-        service_account_json_path = service_account_json_path
+        service_account_json_path = service_account_json_path,
+        last_modified_timestamp = GetBQTableLastModifiedDatetime.last_modified_timestamp
     }
   }
 
@@ -41,10 +56,6 @@ workflow GvsCreateAltAllele {
 }
 
 task GetVetTableNames {
-  meta {
-    volatile: true
-  }
-
   input {
     String dataset_name
     String project_id
@@ -52,7 +63,13 @@ task GetVetTableNames {
     String? service_account_json_path
   }
 
+  meta {
+    # Not `volatile: true` since there shouldn't be a need to re-run this if there has already been a successful execution.
+  }
+
   String has_service_account_file = if (defined(service_account_json_path)) then 'true' else 'false'
+  # add labels for DSP Cloud Cost Control Labeling and Reporting
+  String bq_labels = "--label service:gvs --label team:variants --label managedby:create_alt_allele"
 
   command <<<
     set -e
@@ -64,7 +81,7 @@ task GetVetTableNames {
     fi
 
     echo "project_id = ~{project_id}" > ~/.bigqueryrc
-    bq query --location=US --project_id=~{project_id} --format=csv --use_legacy_sql=false \
+    bq query --location=US --project_id=~{project_id} --format=csv --use_legacy_sql=false ~{bq_labels} \
     'SELECT table_name FROM `~{project_id}.~{dataset_name}.INFORMATION_SCHEMA.TABLES` WHERE table_name LIKE "vet_%" ORDER BY table_name' > vet_tables.csv
 
     # remove the header row from the CSV file
@@ -84,18 +101,20 @@ task GetVetTableNames {
 }
 
 task CreateAltAlleleTable {
-  meta {
-    volatile: true
-  }
-
   input {
+    Boolean go = true
     String dataset_name
     String project_id
 
     String? service_account_json_path
   }
+  meta {
+    # Not `volatile: true` since there shouldn't be a need to re-run this if there has already been a successful execution.
+  }
 
   String has_service_account_file = if (defined(service_account_json_path)) then 'true' else 'false'
+  # add labels for DSP Cloud Cost Control Labeling and Reporting
+  String bq_labels = "--label service:gvs --label team:variants --label managedby:create_alt_allele"
 
   command <<<
     set -e
@@ -107,7 +126,7 @@ task CreateAltAlleleTable {
     fi
 
     echo "project_id = ~{project_id}" > ~/.bigqueryrc
-    bq query --location=US --project_id=~{project_id} --format=csv --use_legacy_sql=false \
+    bq query --location=US --project_id=~{project_id} --format=csv --use_legacy_sql=false ~{bq_labels} \
     'CREATE OR REPLACE TABLE `~{project_id}.~{dataset_name}.alt_allele` (
       location INT64,
       sample_id INT64,
@@ -145,23 +164,25 @@ task CreateAltAlleleTable {
   }
 
   output {
-    String done = "done"
+    Boolean done = true
   }
 }
 
 task PopulateAltAlleleTable {
-  meta {
-    volatile: true
-  }
-
   input {
     String dataset_name
     String project_id
 
     String create_table_done
     String vet_table_name
+    String call_set_identifier
 
     String? service_account_json_path
+
+    String last_modified_timestamp
+  }
+  meta {
+    # Not `volatile: true` since there shouldn't be a need to re-run this if there has already been a successful execution.
   }
 
   String has_service_account_file = if (defined(service_account_json_path)) then 'true' else 'false'
@@ -176,13 +197,14 @@ task PopulateAltAlleleTable {
     fi
 
     python3 /app/populate_alt_allele_table.py \
+      --call_set_identifier ~{call_set_identifier} \
       --query_project ~{project_id} \
       --vet_table_name ~{vet_table_name} \
       --fq_dataset ~{project_id}.~{dataset_name} \
       $SERVICE_ACCOUNT_STANZA
   >>>
   runtime {
-    docker: "us.gcr.io/broad-dsde-methods/variantstore:ah_var_store_2022_05_13"
+    docker: "us.gcr.io/broad-dsde-methods/variantstore:rsa_metadata_from_python_20220628"
     memory: "3 GB"
     disks: "local-disk 10 HDD"
     cpu: 1

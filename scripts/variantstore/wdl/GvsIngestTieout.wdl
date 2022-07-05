@@ -2,7 +2,7 @@ version 1.0
 
 import "GvsAssignIds.wdl" as GvsAssignIds
 import "GvsImportGenomes.wdl" as GvsImportGenomes
-import "GvsUtils.wdl" as GvsUtils
+import "GvsUtils.wdl" as Utils
 
 workflow GvsIngestTieout {
     input {
@@ -15,7 +15,7 @@ workflow GvsIngestTieout {
         String? service_account_json_path
     }
 
-    call GvsUtils.BuildGATKJarAndCreateDataset {
+    call Utils.BuildGATKJarAndCreateDataset {
         input:
             branch_name = branch_name,
             dataset_prefix = "ingest_tieout"
@@ -60,6 +60,10 @@ task IngestTieout {
         String project
         Array[File] stderrs
     }
+    meta {
+        # Do not call cache, dataset may have been updated.
+        volatile: true
+    }
 
     parameter_meta {
         stderrs: {
@@ -76,8 +80,8 @@ task IngestTieout {
 
             bq query --location=US --project_id=~{project} --format=csv --use_legacy_sql=false \
                 "select actual.sample_id, expected.sample_id from
-                (select sample_id, count(*) as count from \`spec-ops-aou.~{dataset_name}.${table_name}\` group by sample_id) actual full outer join
-                (select sample_id, count(*) as count from \`spec-ops-aou.~{reference_dataset_name}.${table_name}\` group by sample_id) expected on actual.sample_id = expected.sample_id
+                (select sample_id, count(*) as count from \`gvs-internal.~{dataset_name}.${table_name}\` group by sample_id) actual full outer join
+                (select sample_id, count(*) as count from \`gvs-internal.~{reference_dataset_name}.${table_name}\` group by sample_id) expected on actual.sample_id = expected.sample_id
                 where actual.count != expected.count OR actual.sample_id is null OR expected.sample_id is null" > differences.txt
 
             if [[ -s differences.txt ]]; then

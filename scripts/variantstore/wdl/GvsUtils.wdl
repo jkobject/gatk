@@ -73,6 +73,9 @@ task SplitIntervals {
     File? gatk_override
     String? service_account_json_path
   }
+  meta {
+    # Not `volatile: true` since there shouldn't be a need to re-run this if there has already been a successful execution.
+  }
 
   String has_service_account_file = if (defined(service_account_json_path)) then 'true' else 'false'
 
@@ -142,15 +145,15 @@ task SplitIntervals {
 }
 
 task GetBQTableLastModifiedDatetime {
-  # because this is being used to determine if the data has changed, never use call cache
-  meta {
-    volatile: true
-  }
-
   input {
+    Boolean go = true
     String query_project
     String fq_table
     String? service_account_json_path
+  }
+  meta {
+    # because this is being used to determine if the data has changed, never use call cache
+    volatile: true
   }
 
   String has_service_account_file = if (defined(service_account_json_path)) then 'true' else 'false'
@@ -159,7 +162,8 @@ task GetBQTableLastModifiedDatetime {
   # try to get the last modified date for the table in question; fail if something comes back from BigQuery
   # that isn't in the right format (e.g. an error)
   command <<<
-    set -e
+    set -o xtrace
+    set -o errexit
 
     if [ ~{has_service_account_file} = 'true' ]; then
       gsutil cp ~{service_account_json_path} local.service_account.json
@@ -194,17 +198,16 @@ task GetBQTableLastModifiedDatetime {
 }
 
 task GetBQTablesMaxLastModifiedTimestamp {
-  # because this is being used to determine if the data has changed, never use call cache
-  meta {
-    volatile: true
-  }
-
   input {
     String query_project
     String data_project
     String data_dataset
     Array[String] table_patterns
     String? service_account_json_path
+  }
+  meta {
+    # because this is being used to determine if the data has changed, never use call cache
+    volatile: true
   }
 
   String has_service_account_file = if (defined(service_account_json_path)) then 'true' else 'false'
@@ -244,6 +247,10 @@ task BuildGATKJarAndCreateDataset {
     String branch_name
     String dataset_prefix
   }
+  meta {
+    # Branch may be updated so do not call cache!
+    volatile: true
+  }
 
   command <<<
     # Much of this could/should be put into a Docker image.
@@ -278,7 +285,13 @@ task BuildGATKJarAndCreateDataset {
     # any remaining characters that are not alphanumeric or underscores.
     dataset="$(echo ~{dataset_prefix}_${branch}_${hash} | tr '-' '_' | tr -c -d '[:alnum:]_')"
 
-    bq mk --project_id="spec-ops-aou" "$dataset"
+    bq mk --project_id="gvs-internal" "$dataset"
+
+    # add labels for DSP Cloud Cost Control Labeling and Reporting
+    bq update --set_label service:gvs gvs-internal:$dataset
+    bq update --set_label team:variants gvs-internal:$dataset
+    bq update --set_label environment:dev gvs-internal:$dataset
+    bq update --set_label managedby:build_gatk_jar_and_create_dataset gvs-internal:$dataset
 
     echo -n "$dataset" > dataset.txt
   >>>
@@ -295,10 +308,13 @@ task BuildGATKJarAndCreateDataset {
   }
 }
 
-
 task TerminateWorkflow {
   input {
     String message
+  }
+  meta {
+    # Definitely do not call cache this!
+    volatile: true
   }
 
   command <<<
@@ -317,6 +333,88 @@ task TerminateWorkflow {
   runtime {
     docker: "python:3.8-slim-buster"
     memory: "1 GB"
+    disks: "local-disk 10 HDD"
+    preemptible: 3
+    cpu: 1
+  }
+
+  output {
+    Boolean done = true
+  }
+}
+
+task ScaleXYBedValues {
+    input {
+        Boolean go = true
+        File interval_weights_bed
+        Float x_bed_weight_scaling
+        Float y_bed_weight_scaling
+    }
+    meta {
+        # Not `volatile: true` since there shouldn't be a need to re-run this if there has already been a successful execution.
+    }
+    command <<<
+        python3 /app/scale_xy_bed_values.py \
+            --input ~{interval_weights_bed} \
+            --output "interval_weights_xy_scaled.bed" \
+            --xscale ~{x_bed_weight_scaling} \
+            --yscale ~{y_bed_weight_scaling} \
+    >>>
+
+    output {
+        File xy_scaled_bed = "interval_weights_xy_scaled.bed"
+        Boolean done = true
+    }
+
+    runtime {
+        docker: "us.gcr.io/broad-dsde-methods/variantstore:rsa_metadata_from_python_20220628"
+        maxRetries: 3
+        memory: "7 GB"
+        preemptible: 3
+        cpu: "2"
+        disks: "local-disk 500 HDD"
+    }
+}
+
+task GetNumSamplesLoaded {
+  input {
+    String fq_sample_table
+    String fq_sample_table_lastmodified_timestamp
+    String? service_account_json_path
+    String project_id
+    Boolean control_samples = false
+  }
+  meta {
+    # Not `volatile: true` since there shouldn't be a need to re-run this if there has already been a successful execution.
+  }
+
+  String has_service_account_file = if (defined(service_account_json_path)) then 'true' else 'false'
+
+  command <<<
+    set -e
+
+    if [ ~{has_service_account_file} = 'true' ]; then
+      gsutil cp ~{service_account_json_path} local.service_account.json
+      gcloud auth activate-service-account --key-file=local.service_account.json
+      gcloud config set project ~{project_id}
+    fi
+
+    echo "project_id = ~{project_id}" > ~/.bigqueryrc
+    bq query --location=US --project_id=~{project_id} --format=csv --use_legacy_sql=false \
+      'SELECT COUNT(*) as num_rows FROM `~{fq_sample_table}` WHERE is_loaded = true and is_control = ~{control_samples}' > num_rows.csv
+
+    NUMROWS=$(python3 -c "csvObj=open('num_rows.csv','r');csvContents=csvObj.read();print(csvContents.split('\n')[1]);")
+
+    [[ $NUMROWS =~ ^[0-9]+$ ]] && echo $NUMROWS || exit 1
+  >>>
+
+  output {
+    Int num_samples = read_int(stdout())
+  }
+
+  runtime {
+    docker: "gcr.io/google.com/cloudsdktool/cloud-sdk:305.0.0"
+    memory: "3 GB"
     disks: "local-disk 10 HDD"
     preemptible: 3
     cpu: 1

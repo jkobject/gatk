@@ -8,12 +8,15 @@ workflow GvsExtractCallset {
     String dataset_name
     String project_id
 
+    String cohort_project_id = project_id
+    String cohort_dataset_name = dataset_name
     Boolean do_not_filter_override = false
     Boolean control_samples = false
     String extract_table_prefix
     String filter_set_name
     String query_project = project_id
-    Int scatter_count
+    # This is optional now since the workflow will choose an appropriate value below if this is unspecified.
+    Int? scatter_count
     Boolean zero_pad_output_vcf_filenames = true
 
     File interval_list = "gs://gcp-public-data--broad-references/hg38/v0/wgs_calling_regions.hg38.noCentromeres.noTelomeres.interval_list"
@@ -28,21 +31,27 @@ workflow GvsExtractCallset {
     String? service_account_json_path
     Int? split_intervals_disk_size_override
     Int? split_intervals_mem_override
+    Float x_bed_weight_scaling = 4
+    Float y_bed_weight_scaling = 4
   }
 
   File reference = "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.fasta"
   File reference_dict = "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.dict"
   File reference_index = "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.fasta.fai"
 
+  String fq_gvs_dataset = "~{project_id}.~{dataset_name}"
+  String fq_cohort_dataset = "~{cohort_project_id}.~{cohort_dataset_name}"
+
   String full_extract_prefix = if (control_samples) then "~{extract_table_prefix}_controls" else extract_table_prefix
-  String fq_cohort_extract_table  = "~{project_id}.~{dataset_name}.~{full_extract_prefix}__DATA"
-  String fq_filter_set_info_table = "~{project_id}.~{dataset_name}.filter_set_info"
-  String fq_filter_set_site_table = "~{project_id}.~{dataset_name}.filter_set_sites"
-  String fq_filter_set_tranches_table = "~{project_id}.~{dataset_name}.filter_set_tranches"
-  String fq_ranges_cohort_ref_extract_table = "~{project_id}.~{dataset_name}.~{full_extract_prefix}__REF_DATA"
-  String fq_ranges_cohort_vet_extract_table = "~{project_id}.~{dataset_name}.~{full_extract_prefix}__VET_DATA"
-  String fq_samples_to_extract_table = "~{project_id}.~{dataset_name}.~{full_extract_prefix}__SAMPLES"
-  String fq_ranges_dataset = "~{project_id}.~{dataset_name}"
+  String fq_filter_set_info_table = "~{fq_gvs_dataset}.filter_set_info"
+  String fq_filter_set_site_table = "~{fq_gvs_dataset}.filter_set_sites"
+  String fq_filter_set_tranches_table = "~{fq_gvs_dataset}.filter_set_tranches"
+  String fq_sample_table = "~{fq_gvs_dataset}.sample_info"
+  String fq_cohort_extract_table = "~{fq_cohort_dataset}.~{full_extract_prefix}__DATA"
+  String fq_ranges_cohort_ref_extract_table = "~{fq_cohort_dataset}.~{full_extract_prefix}__REF_DATA"
+  String fq_ranges_cohort_vet_extract_table = "~{fq_cohort_dataset}.~{full_extract_prefix}__VET_DATA"
+
+  String fq_samples_to_extract_table = "~{fq_cohort_dataset}.~{full_extract_prefix}__SAMPLES"
   Array[String] tables_patterns_for_datetime_check = ["~{full_extract_prefix}__%"]
 
   Boolean emit_pls = false
@@ -50,20 +59,71 @@ workflow GvsExtractCallset {
 
   String intervals_file_extension = if (zero_pad_output_vcf_filenames) then '-~{output_file_base_name}.vcf.gz.interval_list' else '-scattered.interval_list'
 
+  call Utils.ScaleXYBedValues {
+    input:
+      interval_weights_bed = interval_weights_bed,
+      x_bed_weight_scaling = x_bed_weight_scaling,
+      y_bed_weight_scaling = y_bed_weight_scaling
+  }
+
+  call Utils.GetBQTableLastModifiedDatetime as SamplesTableDatetimeCheck {
+    input:
+      query_project = project_id,
+      fq_table = fq_sample_table,
+      service_account_json_path = service_account_json_path
+  }
+
+  call Utils.GetNumSamplesLoaded {
+    input:
+      fq_sample_table = fq_sample_table,
+      fq_sample_table_lastmodified_timestamp = SamplesTableDatetimeCheck.last_modified_timestamp,
+      service_account_json_path = service_account_json_path,
+      project_id = project_id,
+      control_samples = control_samples
+  }
+
+  Int effective_scatter_count = if defined(scatter_count) then select_first([scatter_count])
+                                else if GetNumSamplesLoaded.num_samples < 100 then 100 # Quickstart
+                                     else if GetNumSamplesLoaded.num_samples < 1000 then 500
+                                          else if GetNumSamplesLoaded.num_samples < 5000 then 1000
+                                               else if GetNumSamplesLoaded.num_samples < 20000 then 2000 # Stroke Anderson
+                                                    else if GetNumSamplesLoaded.num_samples < 50000 then 10000
+                                                         else if GetNumSamplesLoaded.num_samples < 100000 then 20000 # Charlie
+                                                              else 40000
+
   call Utils.SplitIntervals {
     input:
       intervals = interval_list,
       ref_fasta = reference,
       ref_fai = reference_index,
       ref_dict = reference_dict,
-      interval_weights_bed = interval_weights_bed,
+      interval_weights_bed = ScaleXYBedValues.xy_scaled_bed,
       intervals_file_extension = intervals_file_extension,
-      scatter_count = scatter_count,
+      scatter_count = effective_scatter_count,
       output_gcs_dir = output_gcs_dir,
       split_intervals_disk_size_override = split_intervals_disk_size_override,
       split_intervals_mem_override = split_intervals_mem_override,
       gatk_override = gatk_override,
       service_account_json_path = service_account_json_path,
+  }
+
+  call Utils.GetBQTableLastModifiedDatetime as FilterSetInfoTimestamp {
+       input:
+       query_project = project_id,
+       fq_table = "~{fq_gvs_dataset}.filter_set_info",
+       service_account_json_path = service_account_json_path,
+  }
+
+  if ( !do_not_filter_override ) {
+    call ValidateFilterSetName {
+      input:
+      query_project = query_project,
+      filter_set_name = filter_set_name,
+      filter_set_info_timestamp = FilterSetInfoTimestamp.last_modified_timestamp,
+      data_project = project_id,
+      data_dataset = dataset_name,
+      service_account_json_path = service_account_json_path
+    }
   }
 
   call Utils.GetBQTablesMaxLastModifiedTimestamp {
@@ -72,15 +132,6 @@ workflow GvsExtractCallset {
       data_project = project_id,
       data_dataset = dataset_name,
       table_patterns = tables_patterns_for_datetime_check,
-      service_account_json_path = service_account_json_path
-  }
-
-  call ValidateFilterSetName {
-    input:
-      query_project = query_project,
-      filter_set_name = filter_set_name,
-      data_project = project_id,
-      data_dataset = dataset_name,
       service_account_json_path = service_account_json_path
   }
 
@@ -102,12 +153,11 @@ workflow GvsExtractCallset {
         fq_ranges_cohort_vet_extract_table = fq_ranges_cohort_vet_extract_table,
         read_project_id                    = query_project,
         do_not_filter_override             = do_not_filter_override,
-        fq_ranges_dataset                  = fq_ranges_dataset,
         fq_filter_set_info_table           = fq_filter_set_info_table,
         fq_filter_set_site_table           = fq_filter_set_site_table,
         fq_filter_set_tranches_table       = fq_filter_set_tranches_table,
         filter_set_name                    = filter_set_name,
-        filter_set_name_verified           = ValidateFilterSetName.done,
+        filter_set_name_verified           = select_first([ValidateFilterSetName.done, "done"]),
         service_account_json_path          = service_account_json_path,
         drop_state                         = "FORTY",
         output_file                        = vcf_filename,
@@ -133,9 +183,18 @@ workflow GvsExtractCallset {
   }
 
   if (control_samples == false) {
+
+    call Utils.GetBQTableLastModifiedDatetime {
+      input:
+        query_project = query_project,
+        fq_table = fq_samples_to_extract_table,
+        service_account_json_path = service_account_json_path
+    }
+
     call GenerateSampleListFile {
       input:
         fq_samples_to_extract_table = fq_samples_to_extract_table,
+        samples_to_extract_table_timestamp = GetBQTableLastModifiedDatetime.last_modified_timestamp,
         output_gcs_dir = output_gcs_dir,
         query_project = query_project,
         service_account_json_path = service_account_json_path
@@ -158,12 +217,18 @@ task ValidateFilterSetName {
     String data_dataset
     String query_project
     String? service_account_json_path
+    String filter_set_info_timestamp
+  }
+  meta {
+    # Not `volatile: true` since there shouldn't be a need to re-run this if there has already been a successful execution.
   }
 
   String has_service_account_file = if (defined(service_account_json_path)) then 'true' else 'false'
+  # add labels for DSP Cloud Cost Control Labeling and Reporting
+  String bq_labels = "--label service:gvs --label team:variants --label managedby:extract_callset"
 
   command <<<
-    set -e
+    set -ex
 
     if [ ~{has_service_account_file} = 'true' ]; then
       gsutil cp ~{service_account_json_path} local.service_account.json
@@ -173,7 +238,7 @@ task ValidateFilterSetName {
 
     echo "project_id = ~{query_project}" > ~/.bigqueryrc
 
-    OUTPUT=$(bq --location=US --project_id=~{query_project} --format=csv query --use_legacy_sql=false "SELECT filter_set_name as available_filter_set_names FROM ~{data_project}.~{data_dataset}.filter_set_info GROUP BY filter_set_name")
+    OUTPUT=$(bq --location=US --project_id=~{query_project} --format=csv query --use_legacy_sql=false ~{bq_labels} "SELECT filter_set_name as available_filter_set_names FROM \`~{data_project}.~{data_dataset}.filter_set_info\` GROUP BY filter_set_name")
     FILTERSETS=${OUTPUT#"available_filter_set_names"}
 
     if [[ $FILTERSETS =~ "~{filter_set_name}" ]]; then
@@ -220,7 +285,6 @@ task ExtractTask {
     Boolean emit_ads
 
     Boolean do_not_filter_override
-    String fq_ranges_dataset
     String fq_filter_set_info_table
     String fq_filter_set_site_table
     String fq_filter_set_tranches_table
@@ -237,6 +301,9 @@ task ExtractTask {
 
     # for call-caching -- check if DB tables haven't been updated since the last run
     String max_last_modified_timestamp
+  }
+  meta {
+    # Not `volatile: true` since there shouldn't be a need to re-run this if there has already been a successful execution.
   }
 
   String has_service_account_file = if (defined(service_account_json_path)) then 'true' else 'false'
@@ -326,6 +393,9 @@ task SumBytes {
   input {
     Array[Float] file_sizes_bytes
   }
+  meta {
+    # Not `volatile: true` since there shouldn't be a need to re-run this if there has already been a successful execution.
+  }
 
   command <<<
     set -e
@@ -353,6 +423,9 @@ task CreateManifest {
       Array[String] manifest_lines
       String? output_gcs_dir
       String? service_account_json_path
+  }
+  meta {
+    # Not `volatile: true` since there shouldn't be a need to re-run this if there has already been a successful execution.
   }
 
   String has_service_account_file = if (defined(service_account_json_path)) then 'true' else 'false'
@@ -388,20 +461,21 @@ task CreateManifest {
 }
 
 task GenerateSampleListFile {
-  # should not call cache in case of withdrawn samples
-  meta {
-    volatile: true
-  }
-
   input {
     String fq_samples_to_extract_table
+    String samples_to_extract_table_timestamp
     String query_project
 
     String? output_gcs_dir
     String? service_account_json_path
   }
+  meta {
+    # Not `volatile: true` since there shouldn't be a need to re-run this if there has already been a successful execution.
+  }
 
   String has_service_account_file = if (defined(service_account_json_path)) then 'true' else 'false'
+  # add labels for DSP Cloud Cost Control Labeling and Reporting
+  String bq_labels = "--label service:gvs --label team:variants --label managedby:extract_callset"
 
   command <<<
     set -e
@@ -417,7 +491,7 @@ task GenerateSampleListFile {
 
     echo "project_id = ~{query_project}" > ~/.bigqueryrc
 
-    bq --location=US --project_id=~{query_project} --format=csv query --use_legacy_sql=false "SELECT sample_name FROM ~{fq_samples_to_extract_table}" | sed 1d > sample-name-list.txt
+    bq --location=US --project_id=~{query_project} --format=csv query --use_legacy_sql=false ~{bq_labels} "SELECT sample_name FROM ~{fq_samples_to_extract_table}" | sed 1d > sample-name-list.txt
 
     if [ -n "$OUTPUT_GCS_DIR" ]; then
       gsutil cp sample-name-list.txt ${OUTPUT_GCS_DIR}/

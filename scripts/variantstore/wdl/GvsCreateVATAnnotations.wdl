@@ -134,6 +134,7 @@ task ExtractAnAcAfFromVCF {
         bcftools annotate -x ^INFO/AC,INFO/AF,INFO/AN,^FORMAT/FT,FORMAT/GT -O b -o filtered.bcf
 
         echo_date "VAT: normalize, left align and split multi allelic sites to new lines, remove duplicate lines"
+        ## note that normalization may create sites with more than 50 alt alleles
         bcftools norm --threads 4 -m- --check-ref w -f Homo_sapiens_assembly38.fasta filtered.bcf -O b -o normalized.bcf
         rm filtered.bcf
 
@@ -185,7 +186,7 @@ task ExtractAnAcAfFromVCF {
     # ------------------------------------------------
     # Runtime settings:
     runtime {
-        docker: "us.gcr.io/broad-dsde-methods/variantstore:ah_var_store_2022_05_02"
+        docker: "us.gcr.io/broad-dsde-methods/variantstore:rsa_metadata_from_python_20220628"
         maxRetries: 3
         memory: "16 GB"
         preemptible: 3
@@ -316,7 +317,7 @@ task PrepAnnotationJson {
     # ------------------------------------------------
     # Runtime settings:
     runtime {
-        docker: "us.gcr.io/broad-dsde-methods/variantstore:ah_var_store_2022_05_02"
+        docker: "us.gcr.io/broad-dsde-methods/variantstore:rsa_metadata_from_python_20220628"
         memory: "8 GB"
         preemptible: 5
         cpu: "1"

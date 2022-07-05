@@ -9,8 +9,9 @@ workflow GvsPrepareCallset {
     # true for control samples only, false for participant samples only
     Boolean control_samples = false
 
-    String extract_table_prefix
+    String call_set_identifier
 
+    String extract_table_prefix = call_set_identifier
     String query_project = project_id
     String destination_project = project_id
     String destination_dataset = dataset_name
@@ -22,17 +23,18 @@ workflow GvsPrepareCallset {
   }
 
   String full_extract_prefix = if (control_samples) then "~{extract_table_prefix}_controls" else extract_table_prefix
-  String fq_petvet_dataset = "~{project_id}.~{dataset_name}"
+  String fq_refvet_dataset = "~{project_id}.~{dataset_name}"
   String fq_sample_mapping_table = "~{project_id}.~{dataset_name}.sample_info"
   String fq_destination_dataset = "~{destination_project}.~{destination_dataset}"
 
   call PrepareRangesCallsetTask {
     input:
+      call_set_identifier              = call_set_identifier,
       destination_cohort_table_prefix = full_extract_prefix,
       sample_names_to_extract         = sample_names_to_extract,
       query_project                   = query_project,
       query_labels                    = query_labels,
-      fq_petvet_dataset               = fq_petvet_dataset,
+      fq_refvet_dataset               = fq_refvet_dataset,
       fq_sample_mapping_table         = fq_sample_mapping_table,
       fq_temp_table_dataset           = fq_temp_table_dataset,
       fq_destination_dataset          = fq_destination_dataset,
@@ -48,18 +50,14 @@ workflow GvsPrepareCallset {
 }
 
 task PrepareRangesCallsetTask {
-  # indicates that this task should NOT be call cached
-  meta {
-    volatile: true
-  }
-
   input {
+    String call_set_identifier
     String destination_cohort_table_prefix
     File? sample_names_to_extract
     String query_project
 
     Boolean control_samples
-    String fq_petvet_dataset
+    String fq_refvet_dataset
     String fq_sample_mapping_table
     String fq_temp_table_dataset
     String fq_destination_dataset
@@ -67,6 +65,10 @@ task PrepareRangesCallsetTask {
     Int temp_table_ttl_in_hours = 24
 
     String? service_account_json_path
+  }
+  meta {
+    # All kinds of BQ reading happening in the referenced Python script.
+    volatile: true
   }
   # Note the coercion of optional query_labels using select_first([expr, default])
   Array[String] query_label_args = if defined(query_labels) then prefix("--query_labels ", select_first([query_labels])) else []
@@ -96,8 +98,9 @@ task PrepareRangesCallsetTask {
       fi
 
       python3 /app/create_ranges_cohort_extract_data_table.py \
+          --call_set_identifier ~{call_set_identifier} \
           --control_samples ~{control_samples} \
-          --fq_ranges_dataset ~{fq_petvet_dataset} \
+          --fq_ranges_dataset ~{fq_refvet_dataset} \
           --fq_temp_table_dataset ~{fq_temp_table_dataset} \
           --fq_destination_dataset ~{fq_destination_dataset} \
           --destination_cohort_table_prefix ~{destination_cohort_table_prefix} \
@@ -113,7 +116,7 @@ task PrepareRangesCallsetTask {
   }
 
   runtime {
-    docker: "us.gcr.io/broad-dsde-methods/variantstore:ah_var_store_2022_05_16"
+    docker: "us.gcr.io/broad-dsde-methods/variantstore:rsa_metadata_from_python_20220628"
     memory: "3 GB"
     disks: "local-disk 100 HDD"
     bootDiskSizeGb: 15

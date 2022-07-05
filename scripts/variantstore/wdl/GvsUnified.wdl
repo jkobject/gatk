@@ -14,6 +14,7 @@ workflow GvsUnified {
         String project_id
 
         Array[String] external_sample_names
+        String call_set_identifier
         Boolean samples_are_controls = false
 
         File? gatk_override
@@ -25,12 +26,15 @@ workflow GvsUnified {
         Array[File] input_vcf_indexes
         File interval_list = "gs://gcp-public-data--broad-references/hg38/v0/wgs_calling_regions.hg38.noCentromeres.noTelomeres.interval_list"
 
+        # The larger the `load_data_batch_size` the greater the probability of preemptions and non-retryable
+        # BigQuery errors. So if increasing the batch size, then preemptible and maxretries should also be increased.
+        Int load_data_batch_size = 5
         Int? load_data_preemptible_override
         Int? load_data_maxretries_override
         # End GvsImportGenomes
 
         # Begin GvsCreateFilterSet
-        String filter_set_name
+        String filter_set_name = call_set_identifier
         Array[String] indel_recalibration_annotation_values = ["AS_FS", "AS_ReadPosRankSum", "AS_MQRankSum", "AS_QD", "AS_SOR"]
         Array[String] snp_recalibration_annotation_values = ["AS_QD", "AS_MQRankSum", "AS_ReadPosRankSum", "AS_FS", "AS_MQ", "AS_SOR"]
 
@@ -53,11 +57,11 @@ workflow GvsUnified {
         # End GvsPrepareRangesCallset
 
         # Begin GvsExtractCallset
-        Int extract_scatter_count
+        Int? extract_scatter_count
 
         File interval_weights_bed = "gs://broad-public-datasets/gvs/weights/gvs_vet_weights_1kb.bed"
 
-        String extract_output_file_base_name = filter_set_name
+        String extract_output_file_base_name = sub(filter_set_name, " ", "-")
 
         Int? extract_maxretries_override
         Int? extract_preemptible_override
@@ -73,7 +77,6 @@ workflow GvsUnified {
             dataset_name = dataset_name,
             project_id = project_id,
             external_sample_names = external_sample_names,
-            samples_are_controls = samples_are_controls,
             assign_ids_gatk_override = gatk_override,
             service_account_json_path = service_account_json_path
     }
@@ -90,11 +93,13 @@ workflow GvsUnified {
             load_data_preemptible_override = load_data_preemptible_override,
             load_data_maxretries_override = load_data_maxretries_override,
             load_data_gatk_override = gatk_override,
-            service_account_json_path = service_account_json_path
+            service_account_json_path = service_account_json_path,
+            load_data_batch_size = load_data_batch_size
     }
 
     call CreateAltAllele.GvsCreateAltAllele {
         input:
+            call_set_identifier = call_set_identifier,
             go = GvsImportGenomes.done,
             dataset_name = dataset_name,
             project_id = project_id,
@@ -120,10 +125,10 @@ workflow GvsUnified {
 
     call PrepareRangesCallset.GvsPrepareCallset {
         input:
+            call_set_identifier = call_set_identifier,
             go = GvsCreateFilterSet.done,
             project_id = project_id,
             dataset_name = dataset_name,
-            control_samples = samples_are_controls,
             extract_table_prefix = extract_table_prefix,
             query_project = query_project,
             destination_project = destination_project,
@@ -139,7 +144,6 @@ workflow GvsUnified {
             go = GvsPrepareCallset.done,
             dataset_name = dataset_name,
             project_id = project_id,
-            control_samples = samples_are_controls,
             extract_table_prefix = extract_table_prefix,
             filter_set_name = filter_set_name,
             query_project = query_project,
