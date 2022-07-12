@@ -192,8 +192,15 @@ task GetBQTableLastModifiedDatetime {
 
         echo "project_id = ~{query_project}" > ~/.bigqueryrc
 
+        # temporary - just to see the response from bq:
+        bq query --nouse_legacy_sql --project_id=~{query_project} --format=csv 'SELECT COUNT (DISTINCT vid) AS count FROM ~{fq_table}'
+        echo "Past the first query"
+
         # bq needs the project name to be separate by a colon
         DATASET_TABLE_COLON=$(echo ~{fq_table} | sed 's/\./:/')
+
+        bq --location=US --project_id=~{query_project} --format=json show ${DATASET_TABLE_COLON}
+        echo "Past the second"
 
         LASTMODIFIED=$(bq --location=US --project_id=~{query_project} --format=json show ${DATASET_TABLE_COLON} | python3 -c "import sys, json; print(json.load(sys.stdin)['lastModifiedTime']);")
         if [[ $LASTMODIFIED =~ ^[0-9]+$ ]]; then
